@@ -4,3 +4,5 @@ cache
 exploits/*
 reports/*
 .env
+out-bounty
+cache-bounty

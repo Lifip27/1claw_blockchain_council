@@ -3,14 +3,16 @@
 //   bun council.ts [TargetName ...]
 import { createClient } from "@1claw/sdk";
 import {
-  createPublicClient, createWalletClient, http, defineChain, parseEther, formatEther,
+  createPublicClient, createWalletClient, http, defineChain, parseEther, formatEther, keccak256, toHex,
   type Abi, type Address, type Hex,
 } from "viem";
 import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
 import { mkdir, writeFile, readFile } from "node:fs/promises";
 
 const FORK_CHAIN_ID = 31337;
-const KEY_PATH = process.env.ONECLAW_KEY_PATH ?? "examples/pentest/attacker-key"; // must match the agent token scopes
+const VAULT_NAME = process.env.ONECLAW_VAULT_NAME ?? "pentest-council"; // created by setup-1claw.ts
+// Paths inside the council vault. (Without setup, everything falls back to examples/pentest/* in the agent's first vault.)
+let KEY_PATH = "keys/attacker", PAYER_KEY_PATH = "keys/bounty-payer", WALLET_PREFIX = "wallets";
 const MAX_HYPOTHESES = 3;
 const MAX_ATTEMPTS = 3;
 const MODELS = { auditor: "sonnet", exploiter: "sonnet", skeptic: "opus" }; // skeptic on a different model on purpose
@@ -57,21 +59,24 @@ let vaultId = process.env.ONECLAW_VAULT_ID;
 async function vault(): Promise<string> {
   if (vaultId) return vaultId;
   const vaults = must(await oc.vault.list(), "vault.list").vaults ?? [];
-  vaultId = vaults[0]?.id ?? must(await oc.vault.create({ name: "pentest-council", description: "Attacker keys for fork-only exploit validation" }), "vault.create").id;
+  const council = vaults.find(v => v.name === VAULT_NAME);
+  if (!council) [KEY_PATH, PAYER_KEY_PATH, WALLET_PREFIX] = ["examples/pentest/attacker-key", "examples/pentest/bounty-payer-key", "examples/pentest/wallets"];
+  vaultId = (council ?? vaults[0])?.id;
+  if (!vaultId) throw new Error("no 1Claw vault: run `bun setup-1claw.ts`");
   return vaultId;
 }
 
-/** Attacker key lives only in 1Claw. Created there on first run, read at the moment of each signature. */
-async function attackerKey(reason: string): Promise<Hex> {
+/** Keys live only in 1Claw. Created there on first use, read at the moment of each signature. */
+async function vaultKey(path: string, purpose: string, reason: string): Promise<Hex> {
   const v = await vault();
-  const r = await oc.secrets.get(v, KEY_PATH, { reason });
+  const r = await oc.secrets.get(v, path, { reason });
   if (r.data?.value) return r.data.value as Hex;
-  must(await oc.secrets.set(v, KEY_PATH, generatePrivateKey(), {
-    type: "private_key",
-    metadata: { purpose: "pentest attacker EOA", allowed_chain_ids: [FORK_CHAIN_ID] },
-  }), "secrets.set");
-  return must(await oc.secrets.get(v, KEY_PATH, { reason }), "secrets.get").value as Hex;
+  must(await oc.secrets.set(v, path, generatePrivateKey(), { type: "private_key", metadata: { purpose } }), "secrets.set");
+  return must(await oc.secrets.get(v, path, { reason }), "secrets.get").value as Hex;
 }
+// vault() runs first: it picks the paths (council vault vs. fallback).
+const attackerKey = async (reason: string) => (await vault(), vaultKey(KEY_PATH, `pentest attacker EOA, chain ${FORK_CHAIN_ID} only`, reason));
+const payerKey = async (reason: string) => (await vault(), vaultKey(PAYER_KEY_PATH, "bug-bounty payer (protocol treasury), testnets/local only", reason));
 
 async function inspect(content: string) {
   const r = await oc.inspectContent({ content, context: "input" });
@@ -90,10 +95,12 @@ function say(target: string, role: string, text: string) {
 const env = { ...process.env };
 for (const k of Object.keys(env)) if (k.startsWith("CLAUDE_CODE_") || k === "CLAUDECODE") delete env[k];
 
-async function ask<T>(model: string, system: string, prompt: string, schema: object): Promise<T> {
+type Usage = { target: string; hyp: string; account: string; tokens: number; costUsd: number };
+const usage: Usage[] = [];
+async function ask<T>(role: Role, at: { target: string; hyp: string }, prompt: string, schema: object): Promise<T> {
   for (let i = 0; i < 2; i++) {
     const p = Bun.spawn([
-      "claude", "-p", "--model", model, "--system-prompt", system,
+      "claude", "-p", "--model", MODELS[role], "--system-prompt", SYS[role],
       "--setting-sources", "", "--strict-mcp-config", "--tools", "", "--no-session-persistence",
       "--json-schema", JSON.stringify(schema), "--output-format", "json",
     ], { stdin: new Blob([prompt]), stdout: "pipe", stderr: "pipe", env });
@@ -101,6 +108,9 @@ async function ask<T>(model: string, system: string, prompt: string, schema: obj
     await p.exited;
     try {
       const j = JSON.parse(out);
+      const u = j.usage ?? {};
+      usage.push({ ...at, account: account(role), costUsd: j.total_cost_usd ?? 0,
+        tokens: (u.input_tokens ?? 0) + (u.output_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) });
       return (j.structured_output ?? JSON.parse(j.result)) as T;
     } catch { if (i === 1) throw new Error(`claude -p bad output: ${out.slice(0, 500)}`); }
   }
@@ -125,12 +135,19 @@ async function artifact(file: string, name: string, outDir = "out"): Promise<Art
   return { abi: j.abi, bytecode: j.bytecode.object };
 }
 
-async function startAnvil(port: number) {
+/** OS-assigned free port, so parallel targets and concurrent runs never share a chain. */
+function freePort() {
+  const s = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
+  const port = s.port; s.stop(true); return port;
+}
+
+async function startAnvil(port = freePort()) {
   const proc = Bun.spawn([ANVIL, "--port", String(port), "--chain-id", String(FORK_CHAIN_ID), "--silent"], { stdout: "ignore", stderr: "ignore" });
   const rpc = `http://127.0.0.1:${port}`;
   const chain = defineChain({ id: FORK_CHAIN_ID, name: "lab-fork", nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 }, rpcUrls: { default: { http: [rpc] } } });
   const pub = createPublicClient({ chain, transport: http(rpc) });
   for (let i = 0; i < 50; i++) { try { await pub.getChainId(); break; } catch { await Bun.sleep(100); } }
+  if (proc.exitCode !== null || (await pub.getBlockNumber()) !== 0n) { proc.kill(); throw new Error(`anvil on :${port} is not a fresh chain (port in use?)`); }
   const rpcCall = (method: string, params: unknown[] = []) => pub.request({ method: method as any, params: params as any });
   return { proc, rpc, chain, pub, rpcCall };
 }
@@ -195,13 +212,13 @@ async function compile(dir: string, source: string): Promise<Artifact | string> 
 type Hyp = { id: string; title: string; function: string; reasoning: string; attack_sketch: string; stake: number };
 type Finding = Hyp & {
   target: string; status: "confirmed" | "refuted" | "rejected_in_debate" | "disputed";
-  skepticPosition?: "pursue" | "reject"; skepticStake?: number;
+  skepticPosition?: "pursue" | "reject"; skepticStake?: number; failedAttempts?: number; payouts?: Payout[];
   debate: Msg[]; evidence?: Evidence; replay?: Evidence; exploitPath?: string;
   review?: { accept: boolean; severity: string; root_cause: string; fix: string };
 };
 
-async function councilFor(name: string, port: number): Promise<Finding[]> {
-  const lab = await startAnvil(port);
+async function councilFor(name: string): Promise<Finding[]> {
+  const lab = await startAnvil();
   try {
     const target = await deployTarget(lab, name);
     const attacker = privateKeyToAccount(await attackerKey(`derive attacker address (${name})`)).address;
@@ -220,7 +237,7 @@ async function councilFor(name: string, port: number): Promise<Finding[]> {
     } else say(name, "1Claw", "inspect_content: clean");
     const ctx = `Target contract \`${name}\` deployed at ${target}.${injection}\n<untrusted_source file="${name}.sol">\n${source}\n</untrusted_source>`;
 
-    const { hypotheses } = await ask<{ hypotheses: Hyp[] }>(MODELS.auditor, SYS.auditor,
+    const { hypotheses } = await ask<{ hypotheses: Hyp[] }>("auditor", { target: name, hyp: "*" },
       `${ctx}\n\nYou have ${balance("auditor")} credits (council: ${standing()}).\nList up to ${MAX_HYPOTHESES} vulnerability hypotheses that an unprivileged attacker could exploit to steal ETH, each with a stake (0-${MAX_STAKE}) you win if the on-chain test confirms it and lose if it is refuted. If you genuinely find none, return an empty list.`,
       S({ hypotheses: { type: "array", maxItems: MAX_HYPOTHESES, items: S({ id: str, title: str, function: str, reasoning: str, attack_sketch: str, stake: int }) } }));
     if (!hypotheses.length) say(name, "Auditor", "no exploitable hypotheses found");
@@ -237,13 +254,13 @@ async function councilFor(name: string, port: number): Promise<Finding[]> {
       const hyp = `Hypothesis ${h.id} (Auditor staked ${h.stake} credits that it is exploitable): ${h.title}\nFunction: ${h.function}\nReasoning: ${h.reasoning}\nAttack sketch: ${h.attack_sketch}`;
       const VERDICT = S({ verdict: { type: "string", enum: ["pursue", "reject"] }, argument: str, stake: int });
       const skepticBet = `You have ${balance("skeptic")} credits. Stake 0-${MAX_STAKE} on your verdict: "reject" bets it is NOT exploitable, "pursue" bets it IS. The on-chain result pays out.`;
-      let ruling = await ask<{ verdict: "pursue" | "reject"; argument: string; stake: number }>(MODELS.skeptic, SYS.skeptic,
+      let ruling = await ask<{ verdict: "pursue" | "reject"; argument: string; stake: number }>("skeptic", { target: name, hyp: h.id },
         `${ctx}\n\n${hyp}\n\nChallenge this. verdict "reject" only if you can show concretely why it cannot work; otherwise "pursue" and state what the exploit must demonstrate.\n${skepticBet}`, VERDICT);
       ruling.stake = clampStake("skeptic", ruling.stake);
       note("Skeptic", `${ruling.verdict.toUpperCase()} (stakes ${ruling.stake}) — ${ruling.argument}`);
       let escalated = false;
       if (ruling.verdict === "reject") {
-        const reb = await ask<{ concede: boolean; escalate: boolean; rebuttal: string }>(MODELS.auditor, SYS.auditor,
+        const reb = await ask<{ concede: boolean; escalate: boolean; rebuttal: string }>("auditor", { target: name, hyp: h.id },
           `${ctx}\n\n${hyp}\n\nThe Skeptic rejected it, staking ${ruling.stake} credits:\n${ruling.argument}\n\n` +
           `Rebut with specifics, or concede if they are right (conceding pays the Skeptic half your stake). ` +
           `If you rebut, also decide whether to escalate: if the Skeptic still rejects, you pay a ${ESCALATION_FEE}-credit fee to force the on-chain test, which then settles both stakes. You have ${balance("auditor")} credits.`,
@@ -256,7 +273,7 @@ async function councilFor(name: string, port: number): Promise<Finding[]> {
           findings.push({ ...h, target: name, status: "rejected_in_debate", skepticPosition: "reject", skepticStake: ruling.stake, debate });
           continue;
         }
-        ruling = await ask(MODELS.skeptic, SYS.skeptic,
+        ruling = await ask("skeptic", { target: name, hyp: h.id },
           `${ctx}\n\n${hyp}\n\nYour objection: ${ruling.argument}\nAuditor's rebuttal: ${reb.rebuttal}\n` +
           `${reb.escalate ? "The Auditor will pay to force the on-chain test if you still reject." : "If you still reject, the hypothesis dies untested."}\n\nFinal ruling. ${skepticBet}`, VERDICT);
         ruling.stake = clampStake("skeptic", ruling.stake);
@@ -280,7 +297,7 @@ async function councilFor(name: string, port: number): Promise<Finding[]> {
       // ── exploitation loop: oracle feedback until profit or attempts run out ──
       let feedback = "", evidence: Evidence | undefined, art: Artifact | undefined, dir = "", value = "0";
       for (let n = 1; n <= MAX_ATTEMPTS && !evidence?.success; n++) {
-        const poc = await ask<{ explanation: string; value_eth: string; solidity: string }>(MODELS.exploiter, SYS.exploiter,
+        const poc = await ask<{ explanation: string; value_eth: string; solidity: string }>("exploiter", { target: name, hyp: h.id },
           `${ctx}\n\n${hyp}\nSkeptic says the PoC must show: ${ruling.argument}\n\n` +
           `Write \`contract Exploit\` (pragma solidity ^0.8.20) with EXACTLY:\n- constructor(address target) payable  — store target and the deployer (msg.sender) as owner\n- function attack() external  — performs the whole attack, then sends ALL ETH it holds to owner\n` +
           `Define any interface you need inline. The attacker EOA has 1 ETH; value_eth (max "0.9") is sent to the constructor. Success = attacker EOA ends with more ETH than it started (net of gas) AND the target lost ETH.` +
@@ -308,7 +325,7 @@ async function councilFor(name: string, port: number): Promise<Finding[]> {
       await reset();
       const replay = await runExploit(lab, target, art!, value, `${name}/${h.id}/replay`);
       note("Oracle", `independent replay on clean snapshot: ${replay.success ? "REPRODUCED" : "FAILED"} (attacker ${replay.attackerDeltaEth}, target ${replay.targetDeltaEth})`);
-      const review = await ask<{ accept: boolean; severity: string; root_cause: string; fix: string }>(MODELS.skeptic, SYS.skeptic,
+      const review = await ask<{ accept: boolean; severity: string; root_cause: string; fix: string }>("skeptic", { target: name, hyp: h.id },
         `${ctx}\n\n${hyp}\n\nPoC source:\n${await readFile(`${dir}/Exploit.sol`, "utf8")}\n\nOn-chain evidence (real signed txs from an unprivileged EOA): ${JSON.stringify(evidence)}\nIndependent replay: ${JSON.stringify(replay)}\n\n` +
         `Does the evidence prove THIS hypothesis (not a different bug, not the attacker just recovering its own deposit)? Give severity (critical/high/medium/low), root cause, and a concrete fix.`,
         S({ accept: bool, severity: str, root_cause: str, fix: str }));
@@ -316,10 +333,110 @@ async function councilFor(name: string, port: number): Promise<Finding[]> {
       const status = review.accept && replay.success ? "confirmed" : "disputed";
       settle(status);
       if (status === "confirmed") pay("exploiter", EXPLOIT_BOUNTY, name, h.id, "bounty: confirmed PoC");
-      findings.push({ ...h, ...skepticStakes, target: name, status, debate, evidence, replay, review, exploitPath: `${dir}/Exploit.sol` });
+      findings.push({ ...h, ...skepticStakes, target: name, status, failedAttempts: failed, debate, evidence, replay, review, exploitPath: `${dir}/Exploit.sol` });
     }
     return findings;
   } finally { lab.proc.kill(); }
+}
+
+// ───────────────────────── bug bounty: real coins, split by tokens + contribution ─────────────────────────
+// Every council agent owns a wallet. Its private key is generated in and held by 1Claw; the agent never sees it.
+const ROLES = Object.keys(MODELS) as Role[];
+const member = (r: Role) => account(r).replace(":", "-").toLowerCase(); // e.g. auditor-sonnet
+/** The payout only needs the address; the key stays in 1Claw (created there if this member has no wallet yet). */
+async function agentWallet(r: Role): Promise<Address> {
+  const v = await vault();
+  const addr = await oc.secrets.get(v, `${WALLET_PREFIX}/${member(r)}/address`, { reason: `bounty payout to ${account(r)}` });
+  if (addr.data?.value) return addr.data.value as Address;
+  const pk = await vaultKey(`${WALLET_PREFIX}/${member(r)}/key`, `wallet of council agent ${account(r)}`, `create ${account(r)} wallet`);
+  const address = privateKeyToAccount(pk).address;
+  must(await oc.secrets.set(v, `${WALLET_PREFIX}/${member(r)}/address`, address, { type: "note" }), "store wallet address");
+  return address;
+}
+const BOUNTY_ETH: Record<string, number> = { critical: 2, high: 1, medium: 0.5, low: 0.2 };
+const POOL_ETH = process.env.BOUNTY_POOL_ETH ?? "5";
+const TOKEN_WEIGHT = 0.4, CONTRIBUTION_WEIGHT = 0.6;
+// Payouts may go to local chains and testnets only. Mainnets are refused.
+const PAYOUT_CHAINS = [FORK_CHAIN_ID, 11155111 /* Sepolia */, 84532 /* Base Sepolia */];
+type Payout = { account: string; wallet: Address; tokens: number; costUsd: number; points: number; share: number; amountEth: string };
+
+/** Contribution points for one confirmed finding. Public, simple, and only for agents that were right. */
+function contributionPoints(f: Finding): Record<Role, number> {
+  return {
+    auditor: 3 + 2 * (f.stake / MAX_STAKE),                                       // found it; confidence bonus for the stake
+    exploiter: Math.max(1, 4 - 0.5 * (f.failedAttempts ?? 0)),                    // proved it; cheaper if it took fewer tries
+    skeptic: 1 + (f.skepticPosition === "pursue" ? 2 * ((f.skepticStake ?? 0) / MAX_STAKE) : 0), // verified it; + bet if right
+  };
+}
+
+function splitBounty(f: Finding, findings: Finding[], wallets: Record<Role, Address>): Payout[] {
+  const roles = ROLES;
+  const nHyps = findings.filter(x => x.target === f.target).length || 1;
+  const tok = (r: Role, key: "tokens" | "costUsd") => usage
+    .filter(u => u.account === account(r) && u.target === f.target && (u.hyp === f.id || u.hyp === "*"))
+    .reduce((s, u) => s + (u.hyp === "*" ? u[key] / nHyps : u[key]), 0);     // the auditor's initial scan is shared across hypotheses
+  const points = contributionPoints(f);
+  const totalTok = roles.reduce((s, r) => s + tok(r, "tokens"), 0) || 1;
+  const totalPts = roles.reduce((s, r) => s + points[r], 0);
+  const bountyWei = parseEther(String(BOUNTY_ETH[f.review?.severity.toLowerCase() ?? ""] ?? BOUNTY_ETH.low));
+  return roles.map(r => {
+    const share = TOKEN_WEIGHT * tok(r, "tokens") / totalTok + CONTRIBUTION_WEIGHT * points[r] / totalPts;
+    return { account: account(r), wallet: wallets[r], tokens: Math.round(tok(r, "tokens")), costUsd: +tok(r, "costUsd").toFixed(4),
+      points: +points[r].toFixed(2), share: +share.toFixed(4), amountEth: formatEther(bountyWei * BigInt(Math.round(share * 1e6)) / 1_000_000n) };
+  });
+}
+
+async function humanApproval(summary: string, payload: object) {
+  const req = must(await oc.approvals.request({
+    action: "bounty.payout", target_type: "bounty_escrow", target_id: runId,
+    summary: { title: "Pay AI-agent bug bounty", body: summary }, payload: payload as Record<string, unknown>,
+    reason: "Council confirmed findings with on-chain proof",
+  }), "approvals.request") as { id: string };
+  say("bounty", "1Claw", `payout approval requested (${req.id}); approve it in the 1Claw dashboard…`);
+  for (;;) {
+    const st = must(await oc.approvals.getStatus(req.id), "approvals.getStatus").status;
+    if (st === "approved") return say("bounty", "1Claw", "payout APPROVED by human");
+    if (st !== "pending") throw new Error(`payout approval ${st}`);
+    await Bun.sleep(3000);
+  }
+}
+
+async function payBounties(findings: Finding[]) {
+  const confirmed = findings.filter(f => f.status === "confirmed");
+  if (!confirmed.length) return say("bounty", "Ledger", "no confirmed findings, no bounty paid");
+  const wallets = Object.fromEntries(await Promise.all(ROLES.map(async r => [r, await agentWallet(r)]))) as Record<Role, Address>;
+  for (const f of confirmed) f.payouts = splitBounty(f, findings, wallets);
+
+  const lab = process.env.BOUNTY_RPC ? null : await startAnvil();
+  const rpc = process.env.BOUNTY_RPC ?? lab!.rpc;
+  const pub = createPublicClient({ transport: http(rpc) });
+  const chainId = await pub.getChainId();
+  if (!PAYOUT_CHAINS.includes(chainId)) throw new Error(`SCOPE VIOLATION: refusing bounty payouts on chain ${chainId}`);
+  const chain = defineChain({ id: chainId, name: `bounty-${chainId}`, nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 }, rpcUrls: { default: { http: [rpc] } } });
+  try {
+    const payer = privateKeyToAccount(await payerKey("derive bounty payer address"));
+    if (lab) await lab.rpcCall("anvil_setBalance", [payer.address, "0x56BC75E2D63100000"]); // local demo: protocol treasury holds 100 ETH
+    const plan = confirmed.map(f => `${f.target}/${f.id} [${f.review?.severity}]: ` + f.payouts!.map(p => `${p.account} ${p.amountEth}`).join(", ")).join("\n");
+    if (process.env.REQUIRE_APPROVAL === "1") await humanApproval(plan, { chainId, findings: confirmed.map(f => ({ target: f.target, id: f.id, payouts: f.payouts })) });
+
+    const w = createWalletClient({ account: await payerKey("sign bounty escrow deploy").then(privateKeyToAccount), chain, transport: http(rpc) });
+    const { abi, bytecode } = await artifact("BountyEscrow.sol", "BountyEscrow", "out-bounty");
+    const r = await pub.waitForTransactionReceipt({ hash: await w.deployContract({ abi, bytecode, value: parseEther(POOL_ETH) }) });
+    const escrow = r.contractAddress!;
+    say("bounty", "Ledger", `protocol funded BountyEscrow ${escrow} with ${POOL_ETH} ETH on chain ${chainId}`);
+    const before = await Promise.all(ROLES.map(r => pub.getBalance({ address: wallets[r] })));
+    for (const f of confirmed) {
+      const proof = keccak256(toHex(JSON.stringify({ target: f.target, id: f.id, txs: f.evidence?.txs, replay: f.replay?.txs })));
+      const pw = createWalletClient({ account: await payerKey(`sign bounty payout ${f.target}/${f.id}`).then(privateKeyToAccount), chain, transport: http(rpc) });
+      const hash = await pw.writeContract({ address: escrow, abi, functionName: "payout",
+        args: [proof, f.payouts!.map(p => p.wallet), f.payouts!.map(p => parseEther(p.amountEth)), f.payouts!.map(p => p.account)] });
+      const ok = (await pub.waitForTransactionReceipt({ hash })).status === "success";
+      say("bounty", "Ledger", `${ok ? "PAID" : "FAILED"} ${f.target}/${f.id} bounty — tx ${hash}\n` + f.payouts!.map(p =>
+        `    ${p.account.padEnd(17)} ${p.amountEth} ETH → ${p.wallet}  (tokens ${p.tokens}, contribution ${p.points} pts, share ${(p.share * 100).toFixed(1)}%)`).join("\n"));
+    }
+    const after = await Promise.all(ROLES.map(r => pub.getBalance({ address: wallets[r] })));
+    say("bounty", "Ledger", "agent wallets received: " + ROLES.map((r, i) => `${account(r)} +${formatEther(after[i]! - before[i]!)} ETH`).join(", "));
+  } finally { lab?.proc.kill(); }
 }
 
 // ───────────────────────── report ─────────────────────────
@@ -333,6 +450,8 @@ function report(findings: Finding[]) {
     const pays = ledger.history.filter(e => e.run === runId && e.target === f.target && e.hyp === f.id);
     md += `\n## ${f.target} · ${f.title}\n\n**Status:** ${f.status}  \n**Function:** \`${f.function}\`  \n**Stakes:** Auditor ${f.stake} on exploitable${f.skepticPosition ? `, Skeptic ${f.skepticStake} on "${f.skepticPosition}"` : ""}\n\n`;
     if (pays.length) md += `**Settlement:** ${pays.map(e => `${e.account} ${e.delta > 0 ? "+" : ""}${e.delta} (${e.reason})`).join("; ")}\n\n`;
+    if (f.payouts) md += `**Bounty paid (${f.review?.severity}):**\n\n| Agent | Agent wallet (key in 1Claw) | Tokens | Contribution pts | Share | Paid |\n|---|---|---|---|---|---|\n` +
+      f.payouts.map(p => `| ${p.account} | \`${p.wallet}\` | ${p.tokens} | ${p.points} | ${(p.share * 100).toFixed(1)}% | ${p.amountEth} ETH |`).join("\n") + "\n\n";
     if (f.review) md += `**Root cause:** ${f.review.root_cause}\n\n**Fix:** ${f.review.fix}\n\n`;
     if (f.evidence) md += `**Evidence:** attacker ${f.evidence.attackerDeltaEth} ETH, target ${f.evidence.targetDeltaEth} ETH, txs \`${f.evidence.txs.join("`, `")}\`${f.evidence.error ? `, error: ${f.evidence.error}` : ""}\n\n`;
     if (f.replay) md += `**Independent replay:** ${f.replay.success ? "reproduced" : "failed"} (attacker ${f.replay.attackerDeltaEth} ETH)\n\n`;
@@ -344,15 +463,18 @@ function report(findings: Finding[]) {
 
 const all = (await Array.fromAsync(new Bun.Glob("*.sol").scan("targets"))).map(f => f.replace(".sol", ""));
 const targets = process.argv.slice(2).length ? process.argv.slice(2) : all;
-const build = Bun.spawnSync([FORGE, "build"]);
-if (build.exitCode !== 0) throw new Error(build.stderr.toString());
+for (const cmd of [[FORGE, "build"], [FORGE, "build", "--contracts", "bounty", "--out", "out-bounty", "--cache-path", "cache-bounty"]]) {
+  const b = Bun.spawnSync(cmd);
+  if (b.exitCode !== 0) throw new Error(b.stderr.toString());
+}
 
 console.log(`\x1b[1mCouncil run ${runId}\x1b[0m — targets: ${targets.join(", ")}\n`);
 await attackerKey("startup: ensure attacker key exists before parallel runs");
-const findings = (await Promise.all(targets.map((t, i) => councilFor(t, 8545 + i)))).flat();
+const findings = (await Promise.all(targets.map((t, i) => councilFor(t)))).flat();
+await payBounties(findings);
 await mkdir(reportDir, { recursive: true });
 await writeFile(`${reportDir}/report.md`, report(findings));
-await writeFile(`${reportDir}/findings.json`, JSON.stringify({ runId, findings, transcript }, null, 2));
+await writeFile(`${reportDir}/findings.json`, JSON.stringify({ runId, findings, usage, transcript }, null, 2));
 await writeFile(LEDGER, JSON.stringify(ledger, null, 2));
 console.log(`\n\x1b[1mReport:\x1b[0m ${reportDir}/report.md`);
 for (const f of findings) console.log(`  ${f.status.padEnd(18)} ${f.target} · ${f.title}`);

