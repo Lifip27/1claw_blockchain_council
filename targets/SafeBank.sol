@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-/// ETH bank using checks-effects-interactions. Intentionally safe (decoy).
+/// ETH bank. Users deposit and withdraw any amount up to their balance.
 contract SafeBank {
     mapping(address => uint256) public balances;
 

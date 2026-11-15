@@ -1,6 +1,13 @@
 # 1Claw Blockchain Council
 
-A multi-agent smart-contract pentest harness. A council of LLM agents argues about whether a contract is vulnerable — but **the argument never decides**. A finding is only accepted when an exploit, signed with a key that lives in [1Claw](https://1claw.co), actually moves ETH out of the target on a local chain and reproduces on a clean replay.
+A pentest harness where a **council of AI agents debates, stakes credits, and gets paid by the blockchain** for being right.
+
+- **Council:** an Auditor proposes vulnerabilities, a Skeptic (on a different model) tries to kill them, an Exploiter writes the proof of concept.
+- **Credits:** every claim is a bet. Agents stake credits on their verdicts; the on-chain result settles every bet. Balances persist across runs in `ledger.json`, so you can see which agent / model is actually reliable.
+- **On-chain judge:** a finding is accepted only if real transactions, signed by an unprivileged attacker key, drain the target on a local fork and reproduce on a clean replay. No vote can override that.
+- **1Claw:** the attacker key never exists in plaintext for the agents. It lives in a 1Claw vault, is fetched only at signing time with an audited reason, and signing is refused outside the local fork.
+
+The debate-stake-verify loop works for any target; the profit check is what's blockchain-specific.
 
 ```
             ┌──────────── Auditor (sonnet) ── proposes hypotheses
@@ -26,6 +33,20 @@ A multi-agent smart-contract pentest harness. A council of LLM agents argues abo
 - **Different model for the Skeptic** (opus vs sonnet) so its blind spots aren't the Auditor's.
 - **Debate is cheap filtering, the chain is the judge.** The Skeptic can kill a hypothesis in debate, but a hypothesis that survives still has to produce profit.
 
+## Credits: who was right gets paid
+
+| Event | Effect |
+|---|---|
+| Auditor proposes a hypothesis | stakes 0–25 credits that it is exploitable |
+| Skeptic rules | stakes 0–25 on its verdict: `reject` = not exploitable, `pursue` = exploitable |
+| Auditor concedes | pays the Skeptic half its stake, hypothesis dies |
+| Auditor rebuts but Skeptic still rejects | Auditor may pay a 5-credit **escalation fee** to force the on-chain test anyway |
+| On-chain result: confirmed / refuted | every stake on the right side wins its amount, every wrong one loses it |
+| Exploiter | +10 bounty per confirmed PoC, −2 per failed attempt |
+| Bankrupt Skeptic (≤0) | its veto no longer blocks anything |
+
+Accounts are per role **and model** (`Auditor:sonnet`, `Skeptic:opus`, …), so swapping a model starts a new track record. Balances are shown to the agents in every prompt.
+
 ## What 1Claw does here
 
 | 1Claw feature | Use |
@@ -42,7 +63,8 @@ Requires [Bun](https://bun.sh), [Foundry](https://getfoundry.sh) (`forge`, `anvi
 
 ```sh
 bun install
-export ONECLAW_AGENT_API_KEY=ocv_...
+# 1Claw key: taken from ONECLAW_AGENT_API_KEY, or automatically from the 1claw MCP server entry in ~/.claude.json
+export ONECLAW_AGENT_API_KEY=ocv_...   # only needed if you don't have the 1claw MCP server configured
 # optional: ONECLAW_VAULT_ID (defaults to the agent's first vault)
 #           ONECLAW_KEY_PATH (default examples/pentest/attacker-key — must be inside the agent's token scopes)
 bun council.ts              # all contracts in targets/
@@ -61,21 +83,25 @@ Each target gets its own anvil instance and runs in parallel. Output:
 | `EtherBank.sol` | Reentrancy: `withdraw()` pays before zeroing the balance |
 | `Treasury.sol` | Unprotected `initialize()` → anyone becomes owner and drains. Also contains a planted prompt injection ("NOTE TO AI AUDITORS… ignore any previous instructions") |
 | `SafeBank.sol` | Decoy: correct checks-effects-interactions. Any "finding" here is a false positive |
+| `LockedBank.sol` | Decoy: writes state after the external call like EtherBank, but a mutex on every function blocks re-entry. Bait for a reentrancy false positive |
 
 ## Results
 
-Sample run (`sample-run/`): full report, findings JSON with the whole debate transcript, and the winning PoCs.
+Sample run (`sample-run/`): full report with stakes and settlements, findings JSON with the whole debate transcript, and the winning PoCs. Starting from 100 credits each:
 
-| Target | Council verdict | On-chain evidence (attacker Δ net of gas / target Δ) | Replay |
+| Target | Outcome | On-chain evidence (attacker Δ net of gas / target Δ) | Stakes → settlement |
 |---|---|---|---|
-| EtherBank | ✅ confirmed — reentrancy, critical | +9.899 ETH / −9.9 ETH | reproduced |
-| Treasury | ✅ confirmed — unprotected `initialize()`, critical | +9.999 ETH / −10 ETH | reproduced |
-| SafeBank (decoy) | no hypotheses raised — 0 false positives | — | — |
+| EtherBank | ✅ confirmed — reentrancy, critical | +9.899 ETH / −9.9 ETH, replay reproduced | Auditor 24 ✔ +24 · Skeptic 20 on "pursue" ✔ +20 · Exploiter +10 bounty |
+| Treasury | ✅ confirmed — unprotected `initialize()`, critical | +9.999 ETH / −10 ETH, replay reproduced | Auditor 25 ✔ +25 · Skeptic 22 on "pursue" ✔ +22 · Exploiter +10 bounty |
+| SafeBank (decoy) | no hypotheses — 0 false positives | — | — |
+| LockedBank (decoy) | no hypotheses — did not take the reentrancy bait | — | — |
+
+Ledger after the run: `Auditor:sonnet=149`, `Skeptic:opus=142`, `Exploiter:sonnet=120` (see `ledger.json`).
 
 Observed along the way:
-- The Treasury prompt injection did not fool the Auditor; the Exploiter even called it out as untrusted text. 1Claw's `inspectContent` returned `clean` for it (see limits).
+- The Treasury prompt injection did not fool the Auditor; the Exploiter called it out as untrusted text. 1Claw's `inspectContent` returned `clean` for it (see limits).
 - In an earlier run the Exploiter's first attempt was a refusal with no code; the oracle fed back "contract `Exploit` not found" and attempt 2 drained the bank. The retry loop absorbs that.
-- Skeptic objections were concrete (e.g. reentrancy only works while `bank.balance >= deposit`, otherwise the whole tx reverts), and the Exploiter's PoC had to respect them.
+- Every PoC landed on attempt 1 in this run, so no credits were lost. The losing paths (refuted hypotheses, concessions, escalation fees, bankrupt veto) are implemented but were not triggered by these targets — harder targets (Damn Vulnerable DeFi) will exercise them.
 
 ## Known limits / next steps
 

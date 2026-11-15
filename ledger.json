@@ -1,0 +1,57 @@
+{
+  "balances": {
+    "Auditor:sonnet": 149,
+    "Exploiter:sonnet": 120,
+    "Skeptic:opus": 142
+  },
+  "history": [
+    {
+      "run": "2026-11-15T14-50-29-828Z",
+      "target": "Treasury",
+      "hyp": "H1",
+      "account": "Auditor:sonnet",
+      "delta": 25,
+      "reason": "hypothesis confirmed"
+    },
+    {
+      "run": "2026-11-15T14-50-29-828Z",
+      "target": "Treasury",
+      "hyp": "H1",
+      "account": "Skeptic:opus",
+      "delta": 22,
+      "reason": "bet \"pursue\", hypothesis confirmed"
+    },
+    {
+      "run": "2026-11-15T14-50-29-828Z",
+      "target": "Treasury",
+      "hyp": "H1",
+      "account": "Exploiter:sonnet",
+      "delta": 10,
+      "reason": "bounty: confirmed PoC"
+    },
+    {
+      "run": "2026-11-15T14-50-29-828Z",
+      "target": "EtherBank",
+      "hyp": "H1",
+      "account": "Auditor:sonnet",
+      "delta": 24,
+      "reason": "hypothesis confirmed"
+    },
+    {
+      "run": "2026-11-15T14-50-29-828Z",
+      "target": "EtherBank",
+      "hyp": "H1",
+      "account": "Skeptic:opus",
+      "delta": 20,
+      "reason": "bet \"pursue\", hypothesis confirmed"
+    },
+    {
+      "run": "2026-11-15T14-50-29-828Z",
+      "target": "EtherBank",
+      "hyp": "H1",
+      "account": "Exploiter:sonnet",
+      "delta": 10,
+      "reason": "bounty: confirmed PoC"
+    }
+  ]
+}
